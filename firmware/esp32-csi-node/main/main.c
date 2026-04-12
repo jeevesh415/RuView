@@ -16,6 +16,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "esp_app_desc.h"
 #include "sdkconfig.h"
 
 #include "csi_collector.h"
@@ -28,6 +29,7 @@
 #include "wasm_upload.h"
 #include "display_task.h"
 #include "mmwave_sensor.h"
+#include "swarm_bridge.h"
 #ifdef CONFIG_CSI_MOCK_ENABLED
 #include "mock_csi.h"
 #endif
@@ -136,7 +138,9 @@ void app_main(void)
     /* Load runtime config (NVS overrides Kconfig defaults) */
     nvs_config_load(&g_nvs_config);
 
-    ESP_LOGI(TAG, "ESP32-S3 CSI Node (ADR-018) — Node ID: %d", g_nvs_config.node_id);
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    ESP_LOGI(TAG, "ESP32-S3 CSI Node (ADR-018) — v%s — Node ID: %d",
+             app_desc->version, g_nvs_config.node_id);
 
     /* Initialize WiFi STA (skip entirely under QEMU mock — no RF hardware) */
 #ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
@@ -166,6 +170,17 @@ void app_main(void)
     }
 #else
     csi_collector_init();
+
+    /* ADR-073: Start multi-frequency channel hopping if configured in NVS. */
+    if (g_nvs_config.channel_hop_count > 1) {
+        ESP_LOGI(TAG, "Starting channel hopping: %u channels, dwell=%lu ms",
+                 (unsigned)g_nvs_config.channel_hop_count,
+                 (unsigned long)g_nvs_config.dwell_ms);
+        csi_collector_set_hop_table(
+            g_nvs_config.channel_list,
+            g_nvs_config.channel_hop_count,
+            g_nvs_config.dwell_ms);
+    }
 #endif
 
     /* ADR-039: Initialize edge processing pipeline. */
@@ -240,6 +255,29 @@ void app_main(void)
         ESP_LOGI(TAG, "No mmWave sensor detected (CSI-only mode)");
     }
 
+    /* ADR-066: Initialize swarm bridge to Cognitum Seed (if configured). */
+    esp_err_t swarm_ret = ESP_ERR_INVALID_ARG;
+#ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
+    if (g_nvs_config.seed_url[0] != '\0') {
+        swarm_config_t swarm_cfg = {
+            .heartbeat_sec = g_nvs_config.swarm_heartbeat_sec,
+            .ingest_sec    = g_nvs_config.swarm_ingest_sec,
+            .enabled       = 1,
+        };
+        strncpy(swarm_cfg.seed_url, g_nvs_config.seed_url, sizeof(swarm_cfg.seed_url) - 1);
+        strncpy(swarm_cfg.seed_token, g_nvs_config.seed_token, sizeof(swarm_cfg.seed_token) - 1);
+        strncpy(swarm_cfg.zone_name, g_nvs_config.zone_name, sizeof(swarm_cfg.zone_name) - 1);
+        swarm_ret = swarm_bridge_init(&swarm_cfg, g_nvs_config.node_id);
+        if (swarm_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Swarm bridge init failed: %s", esp_err_to_name(swarm_ret));
+        }
+    } else {
+        ESP_LOGI(TAG, "Swarm bridge disabled (no seed_url configured)");
+    }
+#else
+    ESP_LOGI(TAG, "Mock CSI mode: skipping swarm bridge");
+#endif
+
     /* Initialize power management. */
     power_mgmt_init(g_nvs_config.power_duty);
 
@@ -251,12 +289,13 @@ void app_main(void)
     }
 #endif
 
-    ESP_LOGI(TAG, "CSI streaming active → %s:%d (edge_tier=%u, OTA=%s, WASM=%s, mmWave=%s)",
+    ESP_LOGI(TAG, "CSI streaming active → %s:%d (edge_tier=%u, OTA=%s, WASM=%s, mmWave=%s, swarm=%s)",
              g_nvs_config.target_ip, g_nvs_config.target_port,
              g_nvs_config.edge_tier,
              (ota_ret == ESP_OK) ? "ready" : "off",
              (wasm_ret == ESP_OK) ? "ready" : "off",
-             (mmwave_ret == ESP_OK) ? "active" : "off");
+             (mmwave_ret == ESP_OK) ? "active" : "off",
+             (swarm_ret == ESP_OK) ? g_nvs_config.seed_url : "off");
 
     /* Main loop — keep alive */
     while (1) {
