@@ -21,6 +21,7 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
    - [Windows WiFi (RSSI Only)](#windows-wifi-rssi-only)
    - [ESP32-S3 (Full CSI)](#esp32-s3-full-csi)
    - [ESP32 Multistatic Mesh (Advanced)](#esp32-multistatic-mesh-advanced)
+   - [Connect Mesh Data to the Dashboard and Observatory](#connect-mesh-data-to-the-dashboard-and-observatory)
    - [Cognitum Seed Integration (ADR-069)](#cognitum-seed-integration-adr-069)
 5. [REST API Reference](#rest-api-reference)
 6. [WebSocket Streaming](#websocket-streaming)
@@ -28,13 +29,14 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
 8. [Vital Sign Detection](#vital-sign-detection)
 9. [CLI Reference](#cli-reference)
 10. [Observatory Visualization](#observatory-visualization)
-11. [Adaptive Classifier](#adaptive-classifier)
+11. [Loading the Pretrained Model from Hugging Face](#loading-the-pretrained-model-from-hugging-face)
+12. [Adaptive Classifier](#adaptive-classifier)
     - [Recording Training Data](#recording-training-data)
     - [Training the Model](#training-the-model)
     - [Using the Trained Model](#using-the-trained-model)
-12. [Training a Model](#training-a-model)
+13. [Training a Model](#training-a-model)
     - [CRV Signal-Line Protocol](#crv-signal-line-protocol)
-13. [RVF Model Containers](#rvf-model-containers)
+14. [RVF Model Containers](#rvf-model-containers)
 14. [Hardware Setup](#hardware-setup)
     - [ESP32-S3 Mesh](#esp32-s3-mesh)
     - [Intel 5300 / Atheros NIC](#intel-5300--atheros-nic)
@@ -103,9 +105,23 @@ Example: `docker run -e CSI_SOURCE=esp32 -p 3000:3000 -p 5005:5005/udp ruvnet/wi
 
 ### From Source (Rust)
 
+On Debian/Ubuntu-based Linux systems, install the native desktop prerequisites before the first Rust release build:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential pkg-config \
+  libglib2.0-dev libgtk-3-dev \
+  libsoup-3.0-dev \
+  libjavascriptcoregtk-4.1-dev \
+  libwebkit2gtk-4.1-dev
+```
+
+This prepares the native GTK/WebKit dependencies used by the desktop/Tauri crates in this workspace.
+
 ```bash
 git clone https://github.com/ruvnet/RuView.git
-cd RuView/rust-port/wifi-densepose-rs
+cd RuView/v2
 
 # Build
 cargo build --release
@@ -265,7 +281,7 @@ Uses CoreWLAN via a Swift helper binary. macOS Sonoma 14.4+ redacts real BSSIDs;
 
 ```bash
 # Compile the Swift helper (once)
-swiftc -O v1/src/sensing/mac_wifi.swift -o mac_wifi
+swiftc -O archive/v1/src/sensing/mac_wifi.swift -o mac_wifi
 
 # Run natively
 ./target/release/sensing-server --source macos --http-port 3000 --ws-port 3001 --tick-ms 500
@@ -316,6 +332,46 @@ The mesh uses a **Time-Division Multiplexing (TDM)** protocol so nodes take turn
 | Attention-weighted fusion | Cross-viewpoint attention with geometric diversity bias |
 
 See [ADR-029](adr/ADR-029-ruvsense-multistatic-sensing-mode.md) and [ADR-032](adr/ADR-032-multistatic-mesh-security-hardening.md) for the full design.
+
+### Connect Mesh Data to the Dashboard and Observatory
+
+If a standalone `aggregator` command prints live packets, the ESP32 fleet is already reaching that host. To visualize the same data, stop the standalone aggregator and run `sensing-server` on that same host and UDP port. The sensing server is the aggregator used by the REST API, WebSocket stream, dashboard, and Observatory.
+
+```bash
+# From a source build
+cd v2
+cargo run -p wifi-densepose-sensing-server -- \
+  --source esp32 \
+  --udp-port 5005 \
+  --http-port 3000 \
+  --ws-port 3001 \
+  --ui-path ../../ui
+
+# Docker
+docker run --rm \
+  -e CSI_SOURCE=esp32 \
+  -p 3000:3000 \
+  -p 3001:3001 \
+  -p 5005:5005/udp \
+  ruvnet/wifi-densepose:latest
+```
+
+Open the UI from the sensing server, not from a local file:
+
+| View | URL |
+|------|-----|
+| Dashboard | `http://localhost:3000/ui/index.html` |
+| Observatory | `http://localhost:3000/ui/observatory.html` |
+
+Use these checks before debugging the browser:
+
+```bash
+curl http://localhost:3000/health
+curl http://localhost:3000/api/v1/nodes
+curl http://localhost:3000/api/v1/sensing/latest
+```
+
+If the ESP32 nodes are provisioned with `--target-ip <AGGREGATOR_HOST>`, that IP must be the machine running `sensing-server`. Only one process can receive UDP `:5005` at a time, so leave the standalone hardware `aggregator` off while the dashboard or Observatory is live.
 
 ### Cognitum Seed Integration (ADR-069)
 
@@ -536,6 +592,110 @@ Both UIs update in real-time via WebSocket and auto-detect the sensing server on
 
 ---
 
+## Dense Point Cloud (Camera + WiFi CSI Fusion)
+
+RuView can generate real-time 3D point clouds by fusing camera depth estimation with WiFi CSI spatial sensing. This creates a spatial model of the environment that updates in real-time.
+
+### Setup
+
+```bash
+# Build the pointcloud binary
+cd v2
+cargo build --release -p wifi-densepose-pointcloud
+
+# Start the server (auto-detects camera + CSI). Loopback-only by default.
+./target/release/ruview-pointcloud serve --bind 127.0.0.1:9880
+```
+
+Open `http://localhost:9880` for the interactive Three.js 3D viewer.
+
+> **Security note.** The server exposes live camera, skeleton, vitals, and occupancy over HTTP. The `--bind` flag defaults to `127.0.0.1:9880` (loopback-only). Exposing on `0.0.0.0` or a LAN IP is opt-in — the server logs a warning when it does, but there is no auth/TLS layer. Put a reverse proxy in front if you need remote access.
+
+> **Brain URL.** Observations are POSTed to `http://127.0.0.1:9876` by default. Override via the `RUVIEW_BRAIN_URL` environment variable or the `--brain <url>` flag on `serve` / `train`.
+
+### Sensors
+
+| Sensor | Auto-detected | Data |
+|--------|--------------|------|
+| Camera (`/dev/video0`) | Yes (Linux UVC) | RGB frames → MiDaS depth → 3D points |
+| ESP32 CSI (UDP:3333) | Yes (if provisioned) | ADR-018 binary → occupancy + pose + vitals |
+| MiDaS depth server (port 9885) | Optional | GPU-accelerated neural depth estimation |
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `ruview-pointcloud serve --bind 127.0.0.1:9880` | Start HTTP server + Three.js viewer (loopback-only by default) |
+| `ruview-pointcloud demo` | Generate synthetic point cloud (no hardware needed) |
+| `ruview-pointcloud capture --output room.ply` | Capture single frame to PLY file |
+| `ruview-pointcloud cameras` | List available cameras |
+| `ruview-pointcloud train --data-dir ./data [--brain URL]` | Depth calibration + occupancy training (writes under canonicalized `data-dir`; refuses `..` traversal) |
+| `ruview-pointcloud csi-test --count 100` | Send test CSI frames (no ESP32 needed) |
+| `ruview-pointcloud fingerprint <name> [--seconds 5]` | Record a named CSI room fingerprint for later matching |
+
+### Pipeline Components
+
+1. **ADR-018 Parser** — Decodes ESP32 CSI binary frames from UDP (magic `0xC5110001` raw CSI and `0xC5110006` feature state), extracts I/Q subcarrier amplitudes and phases. Lives in `parser.rs`; unit-tested against hand-rolled test vectors.
+2. **Pose (stub)** — 17 COCO keypoint *layout* generated by `heuristic_pose_from_amplitude` from CSI amplitude energy. This is **not** the trained WiFlow model — it is a placeholder so the viewer has a skeleton to render. Wiring to real Candle/ONNX inference from the `wifi-densepose-nn` crate is a planned follow-up.
+3. **Vital Signs** — Breathing rate from CSI phase analysis (peak counting on stable subcarrier)
+4. **Motion Detection** — CSI amplitude variance over 20 frames, triggers adaptive capture
+5. **RF Tomography** — Backprojection from per-node RSSI to 8×8×4 occupancy grid
+6. **Camera Depth** — MiDaS monocular depth (GPU) with luminance+edge fallback
+7. **Sensor Fusion** — Voxel-grid merging of camera depth + CSI occupancy
+8. **Brain Bridge** — Stores spatial observations in the ruOS brain every 60 seconds
+
+### API Endpoints
+
+| Endpoint | Method | Returns |
+|----------|--------|---------|
+| `/health` | GET | `{"status": "ok"}` |
+| `/api/status` | GET | Camera, CSI, pipeline state, vitals, motion |
+| `/api/cloud` | GET | Point cloud (up to 1000 points) + pipeline data |
+| `/api/splats` | GET | Gaussian splats for Three.js rendering |
+| `/` | GET | Interactive Three.js 3D viewer |
+
+### Training
+
+The training pipeline calibrates depth estimation and occupancy detection:
+
+```bash
+ruview-pointcloud train --data-dir ~/.local/share/ruview/training --brain http://127.0.0.1:9876
+```
+
+This captures frames, runs depth calibration (grid search over scale/offset/gamma), trains occupancy thresholds, exports DPO preference pairs, and submits results to the ruOS brain.
+
+### Output Formats
+
+- **PLY** — Standard 3D point cloud (ASCII, with RGB color)
+- **Gaussian Splats** — JSON format for Three.js rendering
+- **Brain Memories** — Spatial observations stored as `spatial-observation`, `spatial-motion`, `spatial-vitals`
+
+### Deep Room Scan
+
+Capture a high-quality 3D model of the room:
+
+```bash
+# Stop the live server first (frees the camera)
+# Then capture 20 frames and process with MiDaS
+ruview-pointcloud capture --frames 20 --output room_model.ply
+```
+
+Result: 40,000+ voxels at 5cm resolution, 12,000+ Gaussian splats.
+
+### ESP32 Provisioning for CSI
+
+To send CSI data to the pointcloud server:
+
+```bash
+python3 firmware/esp32-csi-node/provision.py \
+    --port /dev/ttyACM0 \
+    --ssid "YourWiFi" --password "YourPassword" \
+    --target-ip 192.168.1.123 --target-port 3333 \
+    --node-id 1
+```
+
+---
+
 ## Vital Sign Detection
 
 The system extracts breathing rate and heart rate from CSI signal fluctuations using FFT peak detection.
@@ -631,6 +791,67 @@ The Observatory is an immersive Three.js visualization that renders WiFi sensing
 | `R` | Reset camera |
 
 **Live data auto-detect:** When served by the sensing server, the Observatory probes `/health` on the same origin and automatically connects via WebSocket. The HUD badge switches from `DEMO` to `LIVE`. No configuration needed.
+
+---
+
+## Loading the Pretrained Model from Hugging Face
+
+A pretrained CSI encoder + presence-detection head is published on Hugging Face at [`ruvnet/wifi-densepose-pretrained`](https://huggingface.co/ruvnet/wifi-densepose-pretrained). It was trained on 60,630 frames / 610,615 contrastive triplets (12.2M steps, final loss 0.065) and reports 100% presence accuracy and ~164k embeddings/sec on an Apple M4 Pro.
+
+What it ships (and what it does not):
+
+| Capability | Status |
+|------------|--------|
+| Presence detection (occupied / empty) | ✅ Trained head — 100% accuracy on validation |
+| 128-dim CSI embeddings (re-ID, similarity, downstream training) | ✅ Trained encoder |
+| Single-person breathing / heart-rate | ⚠️ Server still uses heuristic DSP — model does not replace this yet |
+| 17-keypoint full-body pose | 🔬 No keypoint weights shipped yet — pose pipeline runs but without a learned head |
+
+### Download
+
+```bash
+pip install huggingface_hub
+huggingface-cli download ruvnet/wifi-densepose-pretrained \
+    --local-dir models/wifi-densepose-pretrained
+```
+
+The download yields a small set of files (the `.rvf.jsonl` is the canonical container the sensing server reads):
+
+```
+models/wifi-densepose-pretrained/
+  model.rvf.jsonl       # RVF container (encoder + presence head + lora)
+  model.safetensors     # 48 KB — same encoder weights, safetensors format
+  model-q4.bin          # 8 KB — recommended quantization for edge
+  presence-head.json    # presence classifier head
+  config.json           # sona-lora rank=8 alpha=16, target encoder + task_heads
+```
+
+### Using the weights
+
+The HF artifact is in **JSONL RVF** format (one JSON object per line: `metadata`, `encoder`, `lora`). What you can do with it today:
+
+| Consumer | Format it reads | Status |
+|----------|-----------------|--------|
+| Python / PyTorch training pipeline | `model.safetensors` | ✅ Works — load with `safetensors.torch.load_file` |
+| RVF JSONL inspection / re-export | `model.rvf.jsonl` | ✅ Works — plain JSONL, parse line-by-line |
+| Sensing-server `--model <PATH>` flag | binary RVF (`RVFS` magic) | ⚠️ Does **not** accept the JSONL file yet — see gap below |
+
+**Known gap (tracked):** `v2/crates/wifi-densepose-sensing-server/src/rvf_container.rs` only parses the binary RVF segment format (magic `0x52564653`). Pointing `--model` at `model.rvf.jsonl` causes the progressive loader to error with `invalid magic at offset 0: expected 0x52564653, got 0x7974227B` (`0x7974227B` is the ASCII bytes `{"ty…` from the JSONL header), and the live pipeline degrades to null output rather than falling back to heuristic mode. Until a JSONL adapter lands (or the model is re-published as binary RVF), run the sensing-server **without** `--model` and consume the HF weights from Python or the training pipeline.
+
+```bash
+# Works today — Python side (training, evaluation, embedding extraction):
+python -c "
+from safetensors.torch import load_file
+state = load_file('models/wifi-densepose-pretrained/model.safetensors')
+print({k: tuple(v.shape) for k, v in state.items()})
+"
+
+# Sensing server — run heuristic for now:
+cargo run -p wifi-densepose-sensing-server --release -- \
+    --source esp32 --udp-port 5005 --http-port 3000
+```
+
+See [RVF Model Containers](#rvf-model-containers) for the binary format the loader expects, and [Training a Model](#training-a-model) for using the encoder as a starting point for environment-specific fine-tuning.
 
 ---
 
@@ -1582,6 +1803,28 @@ rustup update stable
 rustc --version
 ```
 
+### Build: Linux native desktop prerequisites
+
+If you are compiling the Rust workspace on a Debian/Ubuntu-based Linux system, install the native desktop development packages first:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential pkg-config \
+  libglib2.0-dev libgtk-3-dev \
+  libsoup-3.0-dev \
+  libjavascriptcoregtk-4.1-dev \
+  libwebkit2gtk-4.1-dev
+```
+
+Then rerun:
+
+```bash
+cargo build --release
+```
+
+This is the same Linux pre-step referenced in the Rust source build section and covers the common GTK/WebKit `pkg-config` requirements used by the desktop build.
+
 ### Windows: RSSI mode shows no data
 
 Run the terminal as Administrator (required for `netsh wlan` access). Verified working on Windows 10 and 11 with Intel AX201 and Intel BE201 adapters.
@@ -1604,6 +1847,8 @@ The server applies a 3-stage smoothing pipeline (ADR-048). If readings are still
 
 - Verify the sensing server is running: `curl http://localhost:3000/health`
 - Access Observatory via the server URL: `http://localhost:3000/ui/observatory.html` (not a file:// URL)
+- If a standalone `aggregator` command is already listening on UDP `:5005`, stop it and run `sensing-server --source esp32 --udp-port 5005` instead; the Observatory reads the server WebSocket, not the standalone aggregator output
+- Verify the ESP32 nodes are provisioned to the IP address of the machine running `sensing-server`
 - Hard refresh with Ctrl+Shift+R to clear cached settings
 - The auto-detect probes `/health` on the same origin — cross-origin won't work
 

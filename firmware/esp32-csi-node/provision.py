@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-ESP32-S3 CSI Node Provisioning Script
+ESP32 CSI node provisioning (ESP32-S3, ESP32-C6, other targets).
 
 Writes WiFi credentials and aggregator target to the ESP32's NVS partition
 so users can configure a pre-built firmware binary without recompiling.
 
 Usage:
     python provision.py --port COM7 --ssid "MyWiFi" --password "secret" --target-ip 192.168.1.20
+    python provision.py --port /dev/ttyUSB0 --chip esp32c6 --ssid "..." \\
+        --password "..." --target-ip 192.168.1.20
 
 Requirements:
-    pip install esptool nvs-partition-gen
+    pip install 'esptool>=5.0' nvs-partition-gen
     (or use the nvs_partition_gen.py bundled with ESP-IDF)
+
+WARNING -- FULL-REPLACE SEMANTICS (issue #391):
+    Every invocation REPLACES the entire `csi_cfg` NVS namespace on the device.
+    Any key you don't pass on the CLI is erased. Always include WiFi credentials
+    (--ssid, --password, --target-ip) unless you pass --force-partial.
 """
 
 import argparse
@@ -28,6 +35,39 @@ import tempfile
 # 0x6000 (24576) bytes.
 NVS_PARTITION_OFFSET = 0x9000
 NVS_PARTITION_SIZE = 0x6000  # 24 KiB
+
+
+CONFIG_VALUE_CHECKS = [
+    ("ssid", bool),
+    ("password", lambda value: value is not None),
+    ("target_ip", bool),
+    ("target_port", lambda value: value is not None),
+    ("node_id", lambda value: value is not None),
+    ("tdm_slot", lambda value: value is not None),
+    ("tdm_total", lambda value: value is not None),
+    ("edge_tier", lambda value: value is not None),
+    ("pres_thresh", lambda value: value is not None),
+    ("fall_thresh", lambda value: value is not None),
+    ("vital_win", lambda value: value is not None),
+    ("vital_int", lambda value: value is not None),
+    ("subk_count", lambda value: value is not None),
+    ("channel", lambda value: value is not None),
+    ("filter_mac", lambda value: value is not None),
+    ("hop_channels", lambda value: value is not None),
+    ("seed_url", lambda value: value is not None),
+    ("seed_token", lambda value: value is not None),
+    ("zone", lambda value: value is not None),
+    ("swarm_hb", lambda value: value is not None),
+    ("swarm_ingest", lambda value: value is not None),
+]
+
+
+def has_config_value(args):
+    """Return True when args include at least one NVS-writing config value."""
+    return any(
+        check(getattr(args, name, None))
+        for name, check in CONFIG_VALUE_CHECKS
+    )
 
 
 def build_nvs_csv(args):
@@ -138,7 +178,7 @@ def generate_nvs_binary(csv_content, size):
                 os.unlink(p)
 
 
-def flash_nvs(port, baud, nvs_bin):
+def flash_nvs(port, baud, nvs_bin, chip):
     """Flash the NVS partition binary to the ESP32."""
     with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
         f.write(nvs_bin)
@@ -147,13 +187,13 @@ def flash_nvs(port, baud, nvs_bin):
     try:
         cmd = [
             sys.executable, "-m", "esptool",
-            "--chip", "esp32s3",
+            "--chip", chip,
             "--port", port,
             "--baud", str(baud),
-            "write_flash",
+            "write-flash",
             hex(NVS_PARTITION_OFFSET), bin_path,
         ]
-        print(f"Flashing NVS partition ({len(nvs_bin)} bytes) to {port}...")
+        print(f"Flashing NVS partition ({len(nvs_bin)} bytes) to {port} (chip={chip})...")
         subprocess.check_call(cmd)
         print("NVS provisioning complete!")
     finally:
@@ -162,10 +202,20 @@ def flash_nvs(port, baud, nvs_bin):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Provision ESP32-S3 CSI Node with WiFi and aggregator settings",
-        epilog="Example: python provision.py --port COM7 --ssid MyWiFi --password secret --target-ip 192.168.1.20",
+        description="Provision CSI node NVS (WiFi + aggregator); works on S3, C6, etc.",
+        epilog=(
+            "Example: python provision.py --port COM7 --ssid MyWiFi --password secret "
+            "--target-ip 192.168.1.20\n"
+            "ESP32-C6: same, or pass --chip esp32c6 if auto-detect fails "
+            "(default chip is auto for esptool v5+)."
+        ),
     )
     parser.add_argument("--port", required=True, help="Serial port (e.g. COM7, /dev/ttyUSB0)")
+    parser.add_argument(
+        "--chip",
+        default="auto",
+        help="esptool target: auto (default), esp32s3, esp32c6, ... (must match connected chip)",
+    )
     parser.add_argument("--baud", type=int, default=460800, help="Flash baud rate (default: 460800)")
     parser.add_argument("--ssid", help="WiFi SSID")
     parser.add_argument("--password", help="WiFi password")
@@ -199,21 +249,43 @@ def main():
     parser.add_argument("--swarm-hb", type=int, help="Swarm heartbeat interval in seconds (default 30)")
     parser.add_argument("--swarm-ingest", type=int, help="Swarm vector ingest interval in seconds (default 5)")
     parser.add_argument("--dry-run", action="store_true", help="Generate NVS binary but don't flash")
+    parser.add_argument("--force-partial", action="store_true",
+                        help="Allow partial config without WiFi credentials. "
+                        "WARNING: flashing REPLACES the entire csi_cfg NVS namespace - "
+                        "any key not passed on the CLI will be erased (issue #391).")
 
     args = parser.parse_args()
 
-    has_value = any([
-        args.ssid, args.password is not None, args.target_ip,
-        args.target_port, args.node_id is not None,
-        args.tdm_slot is not None, args.tdm_total is not None,
-        args.edge_tier is not None, args.pres_thresh is not None,
-        args.fall_thresh is not None, args.vital_win is not None,
-        args.vital_int is not None, args.subk_count is not None,
-        args.channel is not None, args.filter_mac is not None,
-        args.seed_url is not None, args.zone is not None,
-    ])
-    if not has_value:
+    if not has_config_value(args):
         parser.error("At least one config value must be specified")
+
+    # Bug 2 (#391): Prevent silent wipe of WiFi credentials on partial invocations.
+    # Flashing the generated NVS binary to offset 0x9000 REPLACES the entire
+    # csi_cfg namespace — there is no merge with existing NVS. Require the full
+    # WiFi trio unless the user explicitly opts in with --force-partial.
+    wifi_trio_missing = [
+        name for name, val in [
+            ("--ssid", args.ssid),
+            ("--password", args.password),
+            ("--target-ip", args.target_ip),
+        ] if val is None or val == ""
+    ]
+    if wifi_trio_missing and not args.force_partial:
+        parser.error(
+            f"Missing required WiFi credentials: {', '.join(wifi_trio_missing)}.\n"
+            f"\n"
+            f"  provision.py REPLACES the entire csi_cfg NVS namespace on each run.\n"
+            f"  Any key not passed on the CLI will be erased -- including WiFi creds.\n"
+            f"\n"
+            f"  Either pass all of --ssid, --password, --target-ip,\n"
+            f"  or add --force-partial to acknowledge that other NVS keys will be wiped."
+        )
+    if args.force_partial and wifi_trio_missing:
+        print("WARNING: --force-partial is set. The following NVS keys will be WIPED "
+              "(not present in this invocation):", file=sys.stderr)
+        for k in wifi_trio_missing:
+            print(f"  - {k.lstrip('-')}", file=sys.stderr)
+        print("  Plus any other csi_cfg keys not passed on the CLI.\n", file=sys.stderr)
 
     # Validate TDM: if one is given, both should be
     if (args.tdm_slot is not None) != (args.tdm_total is not None):
@@ -241,7 +313,7 @@ def main():
     if args.ssid:
         print(f"  WiFi SSID:     {args.ssid}")
     if args.password is not None:
-        print(f"  WiFi Password: {'*' * len(args.password)}")
+        print(f"  WiFi Password: {'(set)' if args.password else '(empty)'}")
     if args.target_ip:
         print(f"  Target IP:     {args.target_ip}")
     if args.target_port:
@@ -297,11 +369,11 @@ def main():
         with open(out, "wb") as f:
             f.write(nvs_bin)
         print(f"NVS binary saved to {out} ({len(nvs_bin)} bytes)")
-        print(f"Flash manually: python -m esptool --chip esp32s3 --port {args.port} "
-              f"write_flash 0x9000 {out}")
+        print(f"Flash manually: python -m esptool --chip {args.chip} --port {args.port} "
+              f"write-flash 0x9000 {out}")
         return
 
-    flash_nvs(args.port, args.baud, nvs_bin)
+    flash_nvs(args.port, args.baud, nvs_bin, args.chip)
 
 
 if __name__ == "__main__":

@@ -2,8 +2,9 @@
  * @file edge_processing.c
  * @brief ADR-039 Edge Intelligence — dual-core CSI processing pipeline.
  *
- * Core 0 (WiFi task): Pushes raw CSI frames into lock-free SPSC ring buffer.
- * Core 1 (DSP task):  Pops frames, runs signal processing pipeline:
+ * Core 0 (WiFi path): Pushes raw CSI frames into lock-free SPSC ring buffer.
+ * Second core when present (DSP task): pops frames, runs signal processing pipeline.
+ * On unicore targets (e.g. ESP32-C6), the DSP task is pinned to core 0.
  *   1. Phase extraction from I/Q pairs
  *   2. Phase unwrapping (continuous phase)
  *   3. Welford variance tracking per subcarrier
@@ -19,6 +20,7 @@
 
 #include "edge_processing.h"
 #include "nvs_config.h"
+#include "csi_collector.h"  /* csi_collector_get_node_id() - defensive #390 */
 #include "mmwave_sensor.h"
 
 /* Runtime config — declared in main.c, loaded from NVS at boot. */
@@ -441,7 +443,7 @@ static void send_compressed_frame(const uint8_t *iq_data, uint16_t iq_len,
     uint32_t magic = EDGE_COMPRESSED_MAGIC;
     memcpy(&pkt[0], &magic, 4);
 
-    pkt[4] = g_nvs_config.node_id;
+    pkt[4] = csi_collector_get_node_id();  /* #390: defensive copy */
     pkt[5] = channel;
     memcpy(&pkt[6], &iq_len, 2);
     memcpy(&pkt[8], &comp_len, 2);
@@ -557,7 +559,7 @@ static void send_vitals_packet(void)
     memset(&pkt, 0, sizeof(pkt));
 
     pkt.magic = EDGE_VITALS_MAGIC;
-    pkt.node_id = g_nvs_config.node_id;
+    pkt.node_id = csi_collector_get_node_id();  /* #390: defensive copy */
 
     pkt.flags = 0;
     if (s_presence_detected) pkt.flags |= 0x01;
@@ -647,7 +649,7 @@ static void send_feature_vector(void)
     memset(&pkt, 0, sizeof(pkt));
 
     pkt.magic = EDGE_FEATURE_MAGIC;
-    pkt.node_id = g_nvs_config.node_id;
+    pkt.node_id = csi_collector_get_node_id();  /* #390: defensive copy */
     pkt.reserved = 0;
     pkt.seq = s_feature_seq++;
     pkt.timestamp_us = esp_timer_get_time();
@@ -713,8 +715,11 @@ static void process_frame(const edge_ring_slot_t *slot)
     s_frame_count++;
     s_latest_rssi = slot->rssi;
 
-    /* Assumed CSI sample rate (~20 Hz for typical ESP32 CSI). */
-    const float sample_rate = 20.0f;
+    /* CSI sample rate. MGMT-only promiscuous filter (RuView#396, csi_collector.c)
+     * yields ~10 Hz from beacons; keep this value aligned with csi_collector's
+     * effective callback rate or estimate_bpm_zero_crossing() reports the wrong
+     * BPM (2× rate mismatch → 2× wrong breathing/HR). */
+    const float sample_rate = 10.0f;
 
     /* --- Step 1-2: Phase extraction + unwrapping per subcarrier --- */
     float phases[EDGE_MAX_SUBCARRIERS];
@@ -1046,7 +1051,9 @@ esp_err_t edge_processing_init(const edge_config_t *cfg)
         return ESP_OK;
     }
 
-    /* Start DSP task on Core 1. */
+    /* Pin DSP off WiFi's preferred core when SMP; else core 0 only (ESP32-C6). */
+    const BaseType_t dsp_core = (portNUM_PROCESSORS > 1) ? (BaseType_t)1 : (BaseType_t)0;
+
     BaseType_t ret = xTaskCreatePinnedToCore(
         edge_task,
         "edge_dsp",
@@ -1054,14 +1061,14 @@ esp_err_t edge_processing_init(const edge_config_t *cfg)
         NULL,
         5,          /* Priority 5 — above idle, below WiFi. */
         NULL,
-        1           /* Pin to Core 1. */
-    );
+        dsp_core);
 
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create edge DSP task");
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Edge DSP task created on Core 1 (stack=8192, priority=5)");
+    ESP_LOGI(TAG, "Edge DSP task created on core %d (stack=8192, priority=5)",
+             (int)dsp_core);
     return ESP_OK;
 }

@@ -18,6 +18,7 @@
 #include "nvs_flash.h"
 #include "esp_app_desc.h"
 #include "sdkconfig.h"
+#include "led_strip.h"
 
 #include "csi_collector.h"
 #include "stream_sender.h"
@@ -30,6 +31,8 @@
 #include "display_task.h"
 #include "mmwave_sensor.h"
 #include "swarm_bridge.h"
+#include "rv_radio_ops.h"          /* ADR-081 Layer 1 — Radio Abstraction Layer. */
+#include "adaptive_controller.h"   /* ADR-081 Layer 2 — Adaptive controller. */
 #ifdef CONFIG_CSI_MOCK_ENABLED
 #include "mock_csi.h"
 #endif
@@ -138,9 +141,31 @@ void app_main(void)
     /* Load runtime config (NVS overrides Kconfig defaults) */
     nvs_config_load(&g_nvs_config);
 
+    /* Capture node_id IMMEDIATELY — before wifi_init_sta() can corrupt
+     * g_nvs_config. See #232/#375/#390: WiFi driver init clobbers the struct
+     * on some devices, reverting node_id to the Kconfig default of 1. */
+    csi_collector_set_node_id(g_nvs_config.node_id);
+
     const esp_app_desc_t *app_desc = esp_app_get_description();
     ESP_LOGI(TAG, "ESP32-S3 CSI Node (ADR-018) — v%s — Node ID: %d",
              app_desc->version, g_nvs_config.node_id);
+
+    /* Turn off onboard WS2812 LED on GPIO 38 */
+    led_strip_handle_t led_strip;
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = 38,
+        .max_leds = 1,
+        .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+        .flags.invert_out = false,
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000, // 10MHz
+        .flags.with_dma = false,
+    };
+    if (led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip) == ESP_OK) {
+        led_strip_clear(led_strip);
+    }
 
     /* Initialize WiFi STA (skip entirely under QEMU mock — no RF hardware) */
 #ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
@@ -267,7 +292,7 @@ void app_main(void)
         strncpy(swarm_cfg.seed_url, g_nvs_config.seed_url, sizeof(swarm_cfg.seed_url) - 1);
         strncpy(swarm_cfg.seed_token, g_nvs_config.seed_token, sizeof(swarm_cfg.seed_token) - 1);
         strncpy(swarm_cfg.zone_name, g_nvs_config.zone_name, sizeof(swarm_cfg.zone_name) - 1);
-        swarm_ret = swarm_bridge_init(&swarm_cfg, g_nvs_config.node_id);
+        swarm_ret = swarm_bridge_init(&swarm_cfg, csi_collector_get_node_id());
         if (swarm_ret != ESP_OK) {
             ESP_LOGW(TAG, "Swarm bridge init failed: %s", esp_err_to_name(swarm_ret));
         }
@@ -277,6 +302,31 @@ void app_main(void)
 #else
     ESP_LOGI(TAG, "Mock CSI mode: skipping swarm bridge");
 #endif
+
+    /* ADR-081 Layer 1: register the active radio ops binding.
+     * - Real hardware: ESP32 binding wrapping csi_collector + esp_wifi.
+     * - QEMU / offline: mock binding wrapping mock_csi.c.
+     * Either way, the layers above (adaptive controller, mesh plane,
+     * feature extraction) address the radio through the same vtable —
+     * this is the portability acceptance test in ADR-081. */
+#ifdef CONFIG_CSI_MOCK_ENABLED
+    rv_radio_ops_mock_register();
+#else
+    rv_radio_ops_esp32_register();
+#endif
+    const rv_radio_ops_t *radio_ops = rv_radio_ops_get();
+    if (radio_ops != NULL && radio_ops->init != NULL) {
+        radio_ops->init();
+    }
+
+    /* ADR-081 Layer 2: start the adaptive controller. NULL config → use
+     * Kconfig defaults. Default policy is conservative: no channel
+     * switching, no role change. Operators opt in via menuconfig. */
+    esp_err_t adapt_ret = adaptive_controller_init(NULL);
+    if (adapt_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Adaptive controller init failed: %s",
+                 esp_err_to_name(adapt_ret));
+    }
 
     /* Initialize power management. */
     power_mgmt_init(g_nvs_config.power_duty);
@@ -289,13 +339,14 @@ void app_main(void)
     }
 #endif
 
-    ESP_LOGI(TAG, "CSI streaming active → %s:%d (edge_tier=%u, OTA=%s, WASM=%s, mmWave=%s, swarm=%s)",
+    ESP_LOGI(TAG, "CSI streaming active → %s:%d (edge_tier=%u, OTA=%s, WASM=%s, mmWave=%s, swarm=%s, adapt=%s)",
              g_nvs_config.target_ip, g_nvs_config.target_port,
              g_nvs_config.edge_tier,
              (ota_ret == ESP_OK) ? "ready" : "off",
              (wasm_ret == ESP_OK) ? "ready" : "off",
              (mmwave_ret == ESP_OK) ? "active" : "off",
-             (swarm_ret == ESP_OK) ? g_nvs_config.seed_url : "off");
+             (swarm_ret == ESP_OK) ? g_nvs_config.seed_url : "off",
+             (adapt_ret == ESP_OK) ? "on" : "off");
 
     /* Main loop — keep alive */
     while (1) {
